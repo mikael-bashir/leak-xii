@@ -71,6 +71,24 @@ mcp = FastMCP(
 pool = ReplPool()
 
 SORRY_WARN = re.compile(r"declaration uses 'sorry'")
+# Failures that are about the elaborator running out of ROOM, not about the
+# proof being wrong. The bridge treats these differently: a resource failure is
+# grounds for raising a limit and retrying the SAME submission, never for
+# rewriting the blueprint around a node that was never really refuted.
+RESOURCE_LIMIT = re.compile(
+    r"maximum recursion depth|deterministic timeout|maximum number of heartbeats"
+    r"|\(deterministic\) timeout|maxHeartbeats",
+    re.I,
+)
+
+
+def _is_resource_limit(errs: list[dict]) -> bool:
+    return bool(errs) and all(RESOURCE_LIMIT.search(e.get("msg") or "") for e in errs)
+# Lean's "a tactic ran after its goal was already closed" family ("No goals to
+# be solved", "no goals"). When these are the ONLY errors in a node submission,
+# the proof is complete modulo stray trailing tactics — see the auto-repair in
+# `_compile_node.run_snippet`.
+NO_GOALS = re.compile(r"no goals", re.I)
 
 
 def _messages(resp: dict):
@@ -80,9 +98,38 @@ def _messages(resp: dict):
             "line": (m.get("pos") or {}).get("line"),
             "col": (m.get("pos") or {}).get("column"),
             "msg": m.get("data", ""),
+            "severity": m.get("severity", ""),
         }
         (errs if m.get("severity") == "error" else warns).append(entry)
     return errs, warns
+
+
+def _info_output(warns: list[dict]) -> list[str]:
+    """`#eval` / `#check` / `#print` results.
+
+    Lean returns these at severity "info", which this service used to lump in
+    with warnings and then never report. That silently disabled the pipeline's
+    only numeric oracle: on `factorial_base12_trailing_zeros` the prover ran
+    `#eval Nat.digits 3 2026` and was told, verbatim, "No errors." — the actual
+    digit list discarded — after which the blueprint went on asserting a
+    guessed (and wrong) one. Surfacing info output is what makes `#eval` an
+    oracle instead of a no-op."""
+    out = []
+    for w in warns:
+        if w.get("severity") == "info" and (w.get("msg") or "").strip():
+            if SORRY_WARN.search(w["msg"] or ""):
+                continue
+            out.append(str(w["msg"]).strip())
+    return out
+
+
+def _fmt_info(infos: list[str], limit: int = 12) -> str:
+    if not infos:
+        return ""
+    shown = infos[:limit]
+    more = f"\n  ... and {len(infos) - limit} more" if len(infos) > limit else ""
+    return "\nOutput (#eval / #check / #print):\n" + "\n".join(
+        "  " + i.replace("\n", "\n  ") for i in shown) + more
 
 
 def _strip_imports(code: str) -> tuple[str, list[str]]:
@@ -183,8 +230,11 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
     if sub_imports:
         violations.append(
             f"submission adds import lines ({', '.join(sub_imports)}) — imports come from the canonical statement; this is a safeguard violation")
-    if bp.FORBIDDEN.search(bp.strip_comments(sub)):
-        violations.append("submission uses a forbidden construct ('axiom' or 'native_decide')")
+    violations += bp.forbidden_violations(bp.strip_comments(sub))
+    # Resource-limit `set_option`s survive the canonical rebuild (see
+    # bp.SET_OPTION_WHITELIST); anything else is still a violation.
+    set_opts, opt_violations = bp.extract_set_options(sub)
+    violations += opt_violations
     prelude_opens = set(re.findall(r"^\s*open\s+.*$", prelude or "", re.M))
     for o in re.findall(r"^\s*open\s+.*$", bp.strip_comments(sub), re.M):
         if o.strip() not in {p.strip() for p in prelude_opens}:
@@ -201,10 +251,14 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
 
     prelude = (prelude or "").strip()
     prefix = (prefix or "").strip()
-    header = (prelude + "\n\n" if prelude else "") + (prefix + "\n\n" if prefix else "")
+    # Whitelisted resource options are re-emitted ahead of everything else, so
+    # they govern the sorried parent prefix and the rebuilt declaration alike.
+    opts_block = ("\n".join(set_opts) + "\n\n") if set_opts else ""
+    header = opts_block + (prelude + "\n\n" if prelude else "") + (prefix + "\n\n" if prefix else "")
     header_lines = header.count("\n")
 
-    async def run_snippet(snippet: str, decl_start_line: int, *, negated: bool):
+    async def run_snippet(snippet: str, decl_start_line: int, *, negated: bool,
+                          repair: bool = True):
         try:
             resp = await pool.run(snippet, timeout=NODE_TIMEOUT_S)
         except RuntimeError as e:
@@ -216,17 +270,55 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         goals = [s.get("goal", "") for s in resp.get("sorries", []) or []
                  if ((s.get("pos") or {}).get("line") or 0) >= decl_start_line]
         solve = not errs and not node_sorries and not goals
+
+        # ── Deterministic auto-repair (no LLM): "no goals to be solved" only ──
+        # Observed live (cyclotomic_2026_eval_one): a COMPLETE proof was
+        # resubmitted ~15 times across two attempts and ultimately forfeited
+        # because one trailing tactic (`norm_num` after a goal-closing `rw`)
+        # errored with "No goals to be solved" — a state one line-deletion away
+        # from a registered solve. When EVERY error is of that family and sits
+        # inside the rebuilt declaration, drop exactly those lines and compile
+        # once more. Single retry, never recursive, and strictly no-worse: if
+        # the repaired snippet does not fully solve, the ORIGINAL result is
+        # returned (plus a hint telling the model which lines to delete).
+        if (repair and errs
+                and all(NO_GOALS.search(e["msg"] or "") for e in errs)
+                and all((e.get("line") or 0) >= decl_start_line for e in errs)):
+            drop = {e["line"] for e in errs}
+            kept = [ln for i, ln in enumerate(snippet.split("\n"), start=1)
+                    if i not in drop]
+            repaired = "\n".join(kept)
+            r2 = await run_snippet(repaired, decl_start_line, negated=negated,
+                                   repair=False)
+            if r2.get("solve"):
+                n = len(drop)
+                r2["repairedSnippet"] = repaired
+                r2["report"] = (
+                    f"⚙️ Harness auto-repair: {n} stray tactic line(s) that ran after "
+                    "their goal was already closed (\"no goals to be solved\") were "
+                    "deleted; the remaining proof is complete.\n" + r2["report"])
+                return r2
+            hint = ("\nNote: every error above says a tactic ran AFTER its goal was "
+                    "already closed — the proof is likely complete once those tactic "
+                    "lines are deleted. Resubmit WITHOUT them; do not restructure.")
+            report = "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs) + hint
+            return {"ok": False, "solve": False, "negated": negated, "phase": "compile",
+                    "errors": errs, "openGoals": goals, "report": report}
+
+        infos = _info_output(warns)
         if errs:
-            report = "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs)
+            report = "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs) + _fmt_info(infos)
         elif not solve:
             report = ("Compiles, but the proof still contains sorry — NOT registered as a solve.\n"
-                      + ("Open goals:\n" + "\n---\n".join(goals[:6]) if goals else ""))
+                      + ("Open goals:\n" + "\n---\n".join(goals[:6]) if goals else "")
+                      + _fmt_info(infos))
         else:
             report = ("DISPROOF registered: the negated statement is proven. "
                       if negated else
                       "Proof COMPLETE — solve registered. ") + "Compilation SUCCESSFUL."
         return {"ok": solve, "solve": solve, "negated": negated, "phase": "compile",
-                "errors": errs, "openGoals": goals, "report": report}
+                "errors": errs, "openGoals": goals, "info": infos,
+                "resourceLimit": _is_resource_limit(errs), "report": report}
 
     if main is not None:
         body = main.body.strip()
@@ -236,7 +328,10 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         rebuilt = f"{target_signature.strip()} :=\n  {body}"
         snippet = header + rebuilt
         r = await run_snippet(snippet, header_lines + 1, negated=False)
-        r["rebuilt"] = rebuilt
+        # If the no-goals auto-repair fired, the registered proof must be the
+        # REPAIRED text (what actually compiled), not the submission.
+        r["rebuilt"] = ("\n".join(r["repairedSnippet"].split("\n")[header_lines:])
+                        if r.get("repairedSnippet") else rebuilt)
         return r
 
     if neg is not None:
@@ -248,7 +343,8 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         rebuilt = f"{neg_sig.strip()} :=\n  {body}"
         snippet = header + rebuilt
         r = await run_snippet(snippet, header_lines + 1, negated=True)
-        r["rebuilt"] = rebuilt
+        r["rebuilt"] = ("\n".join(r["repairedSnippet"].split("\n")[header_lines:])
+                        if r.get("repairedSnippet") else rebuilt)
         return r
 
     # Exploration compile: no main theorem in the submission -> raw feedback.
@@ -261,11 +357,14 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
     errs, warns = _messages(resp)
     goals = [s.get("goal", "") for s in resp.get("sorries", []) or []
              if ((s.get("pos") or {}).get("line") or 0) > header_lines]
+    infos = _info_output(warns)
     report = ("[exploration compile — cannot register a solve; resubmit WITH the main theorem to finish]\n"
               + ("Lean errors:\n" + _fmt_errors(errs) if errs else "No errors.")
-              + ("\nOpen goals:\n" + "\n---\n".join(goals[:6]) if goals else ""))
+              + ("\nOpen goals:\n" + "\n---\n".join(goals[:6]) if goals else "")
+              + _fmt_info(infos))
     return {"ok": not errs, "solve": False, "phase": "explore",
-            "errors": errs, "openGoals": goals, "report": report}
+            "errors": errs, "openGoals": goals, "info": infos,
+            "resourceLimit": _is_resource_limit(errs), "report": report}
 
 
 async def _compile_explore(code: str) -> dict:
@@ -275,8 +374,11 @@ async def _compile_explore(code: str) -> dict:
     except RuntimeError as e:
         return {"ok": False, "phase": "compile", "errors": [], "report": f"Compile backend error: {e}"}
     errs, warns = _messages(resp)
-    return {"ok": not errs, "phase": "explore", "errors": errs,
-            "report": ("No errors." if not errs else "Lean errors:\n" + _fmt_errors(errs))}
+    infos = _info_output(warns)
+    return {"ok": not errs, "phase": "explore", "errors": errs, "info": infos,
+            "resourceLimit": _is_resource_limit(errs),
+            "report": ("No errors." if not errs else "Lean errors:\n" + _fmt_errors(errs))
+                      + _fmt_info(infos)}
 
 
 @mcp.tool()
@@ -303,16 +405,17 @@ async def lean_compile(
     original theorem statement -- only your proof body is kept; imports,
     `set_option`, and `open` lines come from the canonical statement, and any
     other top-level declarations are dropped. Only this case can register a
-    solve. Do not use `axiom` or `native_decide`; use `have` for helper
-    lemmas inside your proof, not top-level declarations; do not add
-    `import`/`open` lines beyond what the canonical statement already has --
-    extras are flagged as a safeguard violation, not silently kept.
+    solve. Do not use `axiom`; use `have` for helper lemmas inside your proof,
+    not top-level declarations; do not add `import`/`open` lines beyond what
+    the canonical statement already has -- extras are flagged as a safeguard
+    violation, not silently kept. `set_option` is kept only for resource
+    limits (maxRecDepth, maxHeartbeats, synthInstance.*).
 
     If your code does NOT include the main theorem (e.g. `#check`, `example`,
-    `#print`, helper-lemma prototypes), the system compiles the snippet
-    as-given and returns raw feedback. This is exploration only -- it cannot
-    register a solve, so resubmit with the main theorem once you have a full
-    proof.
+    `#print`, `#eval`, helper-lemma prototypes), the system compiles the
+    snippet as-given and returns raw feedback INCLUDING the output of any
+    `#eval`/`#check`/`#print`. This is exploration only -- it cannot register
+    a solve, so resubmit with the main theorem once you have a full proof.
     """
     logger.info(f"lean_compile mode={mode!r} code={code[:120]!r}...")
     if mode == "blueprint":
